@@ -1,0 +1,9 @@
+matplotlib==3.6.2
+meson==0.64.0
+numpy==1.23.5
+picamera2==0.3.6
+Pillow==9.3.0
+PyQt5==5.15.2
+PyQt5-sip==12.8.1
+scikit-image==0.19.3
+scipy==1.9.3
