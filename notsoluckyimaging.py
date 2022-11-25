@@ -1,9 +1,16 @@
 #!/usr/bin/python3
 import time, os
-
 import numpy as np
+from datetime import datetime
+from multiprocessing import Process, Manager
+import matplotlib.pyplot as plt
+import __main__ as main
+
+#camera functions
 from picamera2 import Picamera2
 from picamera2.encoders import Encoder
+
+### image functions
 from pidng.core import RAW2DNG, DNGTags, Tag
 from pidng.defs import *
 from PIL import Image
@@ -11,23 +18,20 @@ from scipy.ndimage import laplace
 from skimage.util.shape import view_as_windows
 from skimage.measure import blur_effect
 import skimage
-from datetime import datetime
-
-from multiprocessing import Process, Manager
-
-import matplotlib.pyplot as plt
-
+from astropy.io import fits
 
 session = {
     "object_name": "Jupiter",
-    "dng_folder": "/home/pi/luckyimaging/",
+    "save_image_dng" : False,
+    "save_image_fits" : True,
+    "img_folder": "/home/pi/luckyimaging/",
     "tmp_folder": "/home/pi/ramdisk/",
     "num_cpus": 4
 }
 
 raw_camera_settings = {
     "size": (1920, 1080),
-    "bayerformat": "SGBRG12",
+    "bayerformat": "SRGGB12",
     "bit_depth": 12,
     "max_fps": 60,
     "analoggain": (1, 31) # (min, max)
@@ -38,11 +42,11 @@ manual_quality_settings = {
     "min_dynamic_range": 20, # %
     "percentile": (0.1, 99.99),
     #higher is better, no maximum
-    "laplace_threshold": 50.0,
+    "laplace_threshold": 7.0,
     # lower is better, range from 0 to 1.0
-    "blur_threshold": 0.35,
-    "use_gains": [1],
-    "use_exposures": [5e3] * 3
+    "blur_threshold": 0.90,
+    "use_gains": [1, 10],
+    "use_exposures": [20e3, 40e3, 200e3]
 }
 
 config = {
@@ -110,29 +114,93 @@ def process_raw_video(file_path, results):
         gray_image = stride_conv_strided(arr)
 
         # first blure test option - laplace kernel
-        laplaceout = laplace(gray_image)
+        laplaceout = np.std(laplace(gray_image))
 
         # second blure test option - skikit image
         blur_metric = blur_effect(gray_image)
 
-        out = {
-            "config" : config,
-            "min" : min_value,
-            "max" : max_value,
-            "gray" : gray_image,
-            "raw" : arr,
-            "laplace" : np.std(laplaceout),
-            "blurmetric" : blur_metric,
-            "ts" : datetime.timestamp(datetime.now())
-        }
+        image_passed = True
+        if laplaceout < manual_quality_settings["laplace_threshold"]:
+            image_passed = False
 
-        results.append(out)
+        if blur_metric > manual_quality_settings["blur_threshold"]:
+            image_passed = False
 
-        print("Min: {:.0f} Max: {:.0f}, Laplace: {:.1f} Blur: {:.3f}".format(out["min"], out["max"] , out["laplace"], out["blurmetric"]))
+        print("Min: {:.0f} Max: {:.0f}, Laplace: {:.1f} Blur: {:.3f} {}".format(min_value, max_value , 
+                    laplaceout, blur_metric, "*" if image_passed else ""))
+
+        if image_passed:
+
+            out = {
+                "config" : config,
+                "min" : min_value,
+                "max" : max_value,
+                "gray" : gray_image,
+                "raw" : arr,
+                "laplace" : laplaceout,
+                "blurmetric" : blur_metric,
+                "pass" : image_passed,
+                "ts" : datetime.now()
+            }
+
+            results.append(out)
 
     # delete raw file to free memory
     os.remove(file_path)
 
+
+def writeDNGFile(res_dict):
+    # we take this from capture_video_raw example
+    # Create DNG file from frame, based on https://github.com/schoolpost/PiDNG/blob/master/examples/raw2dng.py
+    r = RAW2DNG()
+    t = DNGTags()
+    t.set(Tag.ImageWidth, raw_camera_settings["size"][0])
+    t.set(Tag.ImageLength, raw_camera_settings["size"][1])
+    t.set(Tag.TileWidth, raw_camera_settings["size"][0])
+    t.set(Tag.TileLength, raw_camera_settings["size"][1])
+    t.set(Tag.Orientation, Orientation.Horizontal)
+    t.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
+    t.set(Tag.SamplesPerPixel, 1)
+    t.set(Tag.BitsPerSample, raw_camera_settings["bit_depth"])
+    t.set(Tag.CFARepeatPatternDim, [2, 2])
+    t.set(Tag.CFAPattern, CFAPattern.RGGB)
+    t.set(Tag.DNGVersion, DNGVersion.V1_4)
+    t.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
+    t.set(Tag.Model, "IMX290C")
+    r.options(t, path="", compress=False)
+    filename_dng = "{:.3}_{}_G{:02d}_E{:04d}_{:f}".format(
+        res_dict["blurmetric"], session["object_name"], res_dict["config"]["AnalogueGain"], 
+        res_dict["config"]["ExposureTime"] // 1000, datetime.timestamp(res_dict["ts"]))
+    r.convert(res_dict["raw"], filename=os.path.join(session["img_folder"], filename_dng ) )
+    
+    print(filename_dng + " saved!")
+
+def writeFITSFile(res_dict):
+    filename_fits = "{:.3}_{}_G{:02d}_E{:04d}_{:f}.fits".format(
+        res_dict["blurmetric"], session["object_name"], res_dict["config"]["AnalogueGain"], 
+        res_dict["config"]["ExposureTime"] // 1000, datetime.timestamp(res_dict["ts"]))
+
+    hdu = fits.PrimaryHDU(data=res_dict["raw"])
+    hdu.header["BSCALE"] = 1
+    hdu.header["BITPIX"] = raw_camera_settings["bit_depth"]
+    hdu.header["BZERO"] = 2**raw_camera_settings["bit_depth"]
+    hdu.header["DATE-OBS"] = str(res_dict["ts"].isoformat())
+    hdu.header["OBJECT"] = session["object_name"]
+    hdu.header["OBSERVER"] = main.__file__
+    hdu.header["IMAGETYP"] = "LIGHT"
+    hdu.header["EXPOSURE"] = res_dict["config"]["ExposureTime"] // 1e6
+    hdu.header["EXPTIME"] = hdu.header["EXPOSURE"]
+    hdu.header["INSTRUME"] = "IMX290C"
+    hdu.header["GAIN"] = res_dict["config"]["AnalogueGain"]
+    hdu.header["XPIXSZ"] = raw_camera_settings["size"][0]
+    hdu.header["YPIXSZ"] = raw_camera_settings["size"][1]
+    hdu.header["BAYERPAT"] = "RGGB"
+    hdu.header["XBAYROFF"] = 0
+    hdu.header["YBAYROFF"] = 0
+    #print(hdu.header)
+    hdu.writeto(os.path.join(session["img_folder"], filename_fits ))
+
+    print(filename_fits + " saved!")
 
 if __name__ == "__main__":
     # create a thread save list for the results
@@ -221,45 +289,18 @@ if __name__ == "__main__":
 
         # debug output - save all gray scale images as png and name it with the blure metric
         # stretch the grayscale image to display it later
-        gray_image = skimage.exposure.rescale_intensity(res["gray"], out_range=(100, max_adc_range-100))
-        try:
-            png_path = '/home/pi/ramdisk/pngs/{:.2f}.png'.format(res["blurmetric"])
-            plt.imsave(png_path, gray_image, cmap='gray', vmin=0, vmax=max_adc_range)
-        except Exception as e:
-            print(e)
+        if 0:
+            gray_image = skimage.exposure.rescale_intensity(res["gray"], out_range=(100, max_adc_range-100))
+            try:
+                png_path = '/home/pi/ramdisk/pngs/{:.2f}.png'.format(res["blurmetric"])
+                plt.imsave(png_path, gray_image, cmap='gray', vmin=0, vmax=max_adc_range)
+            except Exception as e:
+                print(e)
 
-
-        #store only selected raw images
-        if res["laplace"] < manual_quality_settings["laplace_threshold"]:
-            continue
-
-        if res["blurmetric"] > manual_quality_settings["blur_threshold"]:
-            continue
-
-        # we take this from capture_video_raw example
-        # Create DNG file from frame, based on https://github.com/schoolpost/PiDNG/blob/master/examples/raw2dng.py
-        r = RAW2DNG()
-        t = DNGTags()
-        t.set(Tag.ImageWidth, raw_camera_settings["size"][0])
-        t.set(Tag.ImageLength, raw_camera_settings["size"][1])
-        t.set(Tag.TileWidth, raw_camera_settings["size"][0])
-        t.set(Tag.TileLength, raw_camera_settings["size"][1])
-        t.set(Tag.Orientation, Orientation.Horizontal)
-        t.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
-        t.set(Tag.SamplesPerPixel, 1)
-        t.set(Tag.BitsPerSample, raw_camera_settings["bit_depth"])
-        t.set(Tag.CFARepeatPatternDim, [2, 2])
-        t.set(Tag.CFAPattern, CFAPattern.RGGB)
-        t.set(Tag.DNGVersion, DNGVersion.V1_4)
-        t.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
-        t.set(Tag.Model, "IMX290C")
-        r.options(t, path="", compress=False)
-        filename_dng = "{:.2}_{}_G{:02d}_E{:04d}_{:f}".format(
-            res["blurmetric"], session["object_name"], res["config"]["AnalogueGain"], 
-            res["config"]["ExposureTime"] // 1000, res["ts"])
-        r.convert(res["raw"], filename=os.path.join(session["dng_folder"], filename_dng ) )
-        
-        print(filename_dng + " saved!")
+        if session["save_image_dng"]:
+            writeDNGFile(res)
+        if session["save_image_fits"]:
+            writeFITSFile(res)
 
 
     plt.show()
