@@ -1,10 +1,12 @@
 #!/usr/bin/python3
-import time, os
+import time, os, signal, sys, glob
 import numpy as np
 from datetime import datetime
-from multiprocessing import Process, Manager
+from multiprocessing import Process, Pool, Queue
+import queue
 import matplotlib.pyplot as plt
 import __main__ as main
+import atexit
 
 #camera functions
 from picamera2 import Picamera2
@@ -20,6 +22,10 @@ from skimage.measure import blur_effect
 import skimage
 from astropy.io import fits
 
+MATPLOTLIB_OUTPUT = False
+
+PRINT_TIME_PROFILING = False
+
 session = {
     "object_name": "Jupiter",
     "save_image_dng" : False,
@@ -33,20 +39,21 @@ raw_camera_settings = {
     "size": (1920, 1080),
     "bayerformat": "SRGGB12",
     "bit_depth": 12,
-    "max_fps": 60,
+    "max_fps": 30, #max 60 but short exposure videos get very fast large
     "analoggain": (1, 31) # (min, max)
 }
 
 manual_quality_settings = {
-    "analyse_frames_per_settings": 10,
-    "min_dynamic_range": 20, # %
+    "store_procent_of_passed_images": 10,
+    "analyse_frames_per_settings": 30,
+    "min_dynamic_range": 10, # %
     "percentile": (0.1, 99.99),
     #higher is better, no maximum
-    "laplace_threshold": 7.0,
+    "laplace_threshold": 1.0,
     # lower is better, range from 0 to 1.0
-    "blur_threshold": 0.90,
-    "use_gains": [1, 10],
-    "use_exposures": [20e3, 40e3, 200e3]
+    "blur_threshold": None,
+    "use_gains": [1, 2],
+    "use_exposures": [20e3] * 3
 }
 
 config = {
@@ -77,76 +84,123 @@ def stride_conv_strided(arr):
     return np.tensordot(arr4D, arr2, axes=((2,3),(0,1)))
 
 
-def process_raw_video(file_path, results):
-    framelist = []
-    # read requested frames in the video
-    try:
-        with open(file_path, "rb") as file_p:
-            for _ in range(manual_quality_settings["analyse_frames_per_settings"] + 1):
-                buf = file_p.read(pixel_cnt * 2)
-                framelist.append(np.frombuffer(buf, dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0])))
-    except Exception as e:
-        return
+def process_raw_video(video_queue, results):
 
-    print("{:d} frames read - start processing".format(len(framelist)))
+    while True:
+        framelist = []
 
-    for i, arr in enumerate(framelist):
-        # discard the first frame - possible other settings
-        if i == 0: 
+        file_path = video_queue.get()
+
+        if file_path == None:
+            print("Close thread - work done")
+            sys.exit(0)
+
+        st = datetime.timestamp(datetime.now())
+        # read requested frames in the video
+        try:
+            with open(file_path, "rb") as file_p:
+                for _ in range(manual_quality_settings["analyse_frames_per_settings"] + 1):
+                    buf = file_p.read(pixel_cnt * 2)
+                    framelist.append(np.frombuffer(buf, dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0])))
+        except Exception as e:
             continue
-        
-        if i > manual_quality_settings["analyse_frames_per_settings"]:
-            break
+        if PRINT_TIME_PROFILING:
+                print("read video file", datetime.timestamp(datetime.now()) - st)
 
-        min_value, max_value = np.percentile(arr, manual_quality_settings["percentile"])
+        print("{:d} frames read - start processing".format(len(framelist)))
 
-        range_percent = (max_value - min_value) / max_adc_range * 100
+        for i, arr in enumerate(framelist):
+            # discard the first frame - possible other settings
+            if i == 0: 
+                continue
+            
+            if i > manual_quality_settings["analyse_frames_per_settings"]:
+                break
 
-        if range_percent < manual_quality_settings["min_dynamic_range"]:
-            print("Low dynamic range (min {:.1f}, max {:.1f}) detected - skip". format(min_value, max_value))
-            continue
+            st = datetime.timestamp(datetime.now())
+            min_value, max_value = np.percentile(arr, manual_quality_settings["percentile"])
+            if PRINT_TIME_PROFILING:
+                print("percentile", datetime.timestamp(datetime.now()) - st)
 
-        if max_value >= max_adc_range:
-            print("Sensor saturation - skip")
-            continue
-        
-        # convert bayer to grayscale with convolution - there is no fancy debayer algo. ongoing
-        gray_image = stride_conv_strided(arr)
+            range_percent = (max_value - min_value) / max_adc_range * 100
 
-        # first blure test option - laplace kernel
-        laplaceout = np.std(laplace(gray_image))
+            if range_percent < manual_quality_settings["min_dynamic_range"]:
+                print("Low dynamic range (min {:.1f}, max {:.1f}) detected - skip". format(min_value, max_value))
+                continue
 
-        # second blure test option - skikit image
-        blur_metric = blur_effect(gray_image)
+            if max_value >= max_adc_range:
+                print("Sensor saturation - skip")
+                continue
+            
+            st = datetime.timestamp(datetime.now())
+            # convert bayer to grayscale with convolution - there is no fancy debayer algo. ongoing
+            gray_image = stride_conv_strided(arr)
 
-        image_passed = True
-        if laplaceout < manual_quality_settings["laplace_threshold"]:
-            image_passed = False
+            if PRINT_TIME_PROFILING:
+                print("stride_conv_strided", datetime.timestamp(datetime.now()) - st)
 
-        if blur_metric > manual_quality_settings["blur_threshold"]:
-            image_passed = False
+            image_passed = True
+            laplaceout = None
+            blur_metric = None
 
-        print("Min: {:.0f} Max: {:.0f}, Laplace: {:.1f} Blur: {:.3f} {}".format(min_value, max_value , 
-                    laplaceout, blur_metric, "*" if image_passed else ""))
+    
+            # first blure test option - laplace kernel
+            if manual_quality_settings["laplace_threshold"] is not None:
+                st = datetime.timestamp(datetime.now())
+                laplaceout = np.std(laplace(gray_image))
+                if laplaceout < manual_quality_settings["laplace_threshold"]:
+                    image_passed = False
 
-        if image_passed:
+                if PRINT_TIME_PROFILING:
+                    print("np.std(laplace)", datetime.timestamp(datetime.now()) - st)
 
-            out = {
-                "config" : config,
-                "min" : min_value,
-                "max" : max_value,
-                "gray" : gray_image,
-                "raw" : arr,
-                "laplace" : laplaceout,
-                "blurmetric" : blur_metric,
-                "pass" : image_passed,
-                "ts" : datetime.now()
-            }
+            # second blure test option - skikit image
+            if manual_quality_settings["blur_threshold"] is not None:
+                st = datetime.timestamp(datetime.now())
+                blur_metric = blur_effect(gray_image)
+                if blur_metric > manual_quality_settings["blur_threshold"]:
+                    image_passed = False
+                if PRINT_TIME_PROFILING:
+                    print("blur_effect", datetime.timestamp(datetime.now()) - st)
 
-            results.append(out)
+            blur_str = "{:.3f}".format(blur_metric) if blur_metric is not None else "None"
+            laplace_str = "{:.1f}".format(laplaceout) if laplaceout is not None else "None"
 
-    # delete raw file to free memory
-    os.remove(file_path)
+            print("Min: {:.0f} Max: {:.0f}, Laplace: {} Blur: {} {}".format(min_value, max_value , 
+                        laplace_str, blur_str, "*" if image_passed else ""))
+
+            if image_passed:
+
+                out = {
+                    "config" : config,
+                    "min" : min_value,
+                    "max" : max_value,
+                    "gray" : gray_image,
+                    "raw" : arr,
+                    "laplace" : laplaceout,
+                    "blurmetric" : blur_metric,
+                    "pass" : image_passed,
+                    "ts" : datetime.now()
+                }
+
+                st = datetime.timestamp(datetime.now())
+                results.put(out, timeout = 1.0)
+                if PRINT_TIME_PROFILING:
+                    print("append", datetime.timestamp(datetime.now()) - st)
+
+        st = datetime.timestamp(datetime.now())
+        # delete raw file to free memory
+        os.remove(file_path)
+        if PRINT_TIME_PROFILING:
+            print("remove video", datetime.timestamp(datetime.now()) - st)
+
+def storeImages(res):
+    if session["save_image_dng"]:
+        writeDNGFile(res)
+    if session["save_image_fits"]:
+        writeFITSFile(res)
+
+    return 0
 
 
 def writeDNGFile(res_dict):
@@ -168,17 +222,19 @@ def writeDNGFile(res_dict):
     t.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
     t.set(Tag.Model, "IMX290C")
     r.options(t, path="", compress=False)
-    filename_dng = "{:.3}_{}_G{:02d}_E{:04d}_{:f}".format(
-        res_dict["blurmetric"], session["object_name"], res_dict["config"]["AnalogueGain"], 
-        res_dict["config"]["ExposureTime"] // 1000, datetime.timestamp(res_dict["ts"]))
+    blur_function = "blurmetric" if results[-1]["blurmetric"] is not None else "laplace"
+    filename_dng = "{:.3f}_{}_G{:02d}_E{:04d}_{:f}".format(
+        res_dict[blur_function], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
+        int(res_dict["config"]["ExposureTime"] // 1000), datetime.timestamp(res_dict["ts"]))
     r.convert(res_dict["raw"], filename=os.path.join(session["img_folder"], filename_dng ) )
     
     print(filename_dng + " saved!")
 
 def writeFITSFile(res_dict):
-    filename_fits = "{:.3}_{}_G{:02d}_E{:04d}_{:f}.fits".format(
-        res_dict["blurmetric"], session["object_name"], res_dict["config"]["AnalogueGain"], 
-        res_dict["config"]["ExposureTime"] // 1000, datetime.timestamp(res_dict["ts"]))
+    blur_function = "blurmetric" if results[-1]["blurmetric"] is not None else "laplace"
+    filename_fits = "{:.3f}_{}_G{:02d}_E{:04d}_{:f}.fits".format(
+        res_dict[blur_function], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
+        int(res_dict["config"]["ExposureTime"] // 1000), datetime.timestamp(res_dict["ts"]))
 
     hdu = fits.PrimaryHDU(data=res_dict["raw"])
     hdu.header["BSCALE"] = 1
@@ -203,9 +259,10 @@ def writeFITSFile(res_dict):
     print(filename_fits + " saved!")
 
 if __name__ == "__main__":
+
     # create a thread save list for the results
-    manager = Manager()
-    results = manager.list([])
+    results_queue = Queue()
+    video_queue = Queue(session["num_cpus"])
 
     # init camera device
     picam2 = Picamera2()
@@ -214,8 +271,14 @@ if __name__ == "__main__":
     picam2.encode_stream_name = "raw"
     encoder = Encoder()
 
-    # create process slots 
-    procs = [None] * session["num_cpus"]
+    procs = []
+    for _ in range(session["num_cpus"]):
+        procs.append(Process(target=process_raw_video, args=(video_queue, results_queue)))
+        procs[-1].start()
+
+    start_time = datetime.timestamp(datetime.now())
+
+    results = []
 
     for gain in manual_quality_settings["use_gains"]:
         for exposure in manual_quality_settings["use_exposures"]:
@@ -226,81 +289,125 @@ if __name__ == "__main__":
             # do camera settings
             config["AnalogueGain"] = gain
             config["ExposureTime"] = int(exposure)
-            config["FrameRate"] = min(fps_exposure, 30)
-            picam2.set_controls(config)
+            config["FrameRate"] = min(fps_exposure, raw_camera_settings["max_fps"])
+
 
             print("Stard recording with Gain: {} and Exposure time: {} ms".format(config["AnalogueGain"], config["ExposureTime"] / 1e3))
 
             # record into a ramfs or tmpfs storage for speed
             tmp_video_path = os.path.join(session["tmp_folder"], "tmp" + str(datetime.timestamp(datetime.now())) + ".raw")
             tmp_pts_path = os.path.join(session["tmp_folder"], "timestamp.txt")
+
+            picam2.set_controls(config)
+            # we need this delay to give the libcamera driver some time for the next record
+            # else we see an IO error
+            time.sleep(0.5)
             picam2.start_recording(encoder, tmp_video_path, pts=tmp_pts_path)
             # for small exposures record min two seconds to grab enouth frames
             time.sleep(max(2, (manual_quality_settings["analyse_frames_per_settings"] + 2) * 1/fps_exposure))
-
             picam2.stop_recording()
 
-            # search free proccess slot
-            keep_while_running = True
-            while keep_while_running:
-                for i, proc in enumerate(procs):
-                    if proc is None or proc.is_alive() == False:
-                        procs[i] = Process(target=process_raw_video, args=(tmp_video_path, results))
-                        procs[i].start()
-                        keep_while_running = False
-                        break
-                time.sleep(0.1)
+            video_queue.put(tmp_video_path)
+
+    for _ in range(len(procs)):
+        try:
+            video_queue.put(None)
+        except:
+            print("Send exit command failed")
 
     #wait for all ongoing threads
     for proc in procs:
-        if proc is not None:
-            proc.join()
+        # workaround to avoid hanging queue because of the large size used here
+        results_queue.cancel_join_thread()
+
+        while proc.is_alive():
+            # get the last data from queue
+            while True:
+                try:
+                    results.append(results_queue.get(block = False))
+                except queue.Empty:
+                    break
+            try:
+                proc.join(timeout = 0.1)
+            except:
+                print("Join fails", proc.is_alive())
+                break
+
+    print("Collecting list")
+
 
     if len(results) <= 0:
         print("No image data recorded")
         exit()            
 
-    # take the worst and the best to display the gray scale images
-    bestseeing = min(results, key=lambda x:x['blurmetric'])
-    worstseeing = max(results, key=lambda x:x['blurmetric'])
+    blur_function = "blurmetric" if results[-1]["blurmetric"] is not None else "laplace"
 
-    hist_best, _ = np.histogram(bestseeing["gray"], 64, (0, max_adc_range))
-    hist_worst, _ = np.histogram(worstseeing["gray"], 64, (0, max_adc_range))
+    if MATPLOTLIB_OUTPUT:
+        # take the worst and the best to display the gray scale images
 
-    ### display grayscale images
-    f, axarr = plt.subplots(2,2)
-    best_im = bestseeing["gray"]
-    best_im = skimage.exposure.rescale_intensity(best_im, out_range=(0, 255))
-    print("Best blure", bestseeing['blurmetric'])
-    axarr[0,0].imshow(best_im, cmap='gray', vmin=0, vmax=255)
-    worst_img = worstseeing["gray"]
-    worst_img = skimage.exposure.rescale_intensity(worst_img, out_range=(0, 255))
-    print("Worst blure", worstseeing['blurmetric'])
-    axarr[1,0].imshow(worst_img, cmap='gray', vmin=0, vmax=255)
+        bestseeing = min(results, key=lambda x:x[blur_function])
+        worstseeing = max(results, key=lambda x:x[blur_function])
 
-    ### display historgrams
-    x_histo = np.linspace(0, max_adc_range, len(hist_best), endpoint = False)
-    axarr[0,1].plot(x_histo, hist_best)
-    #axarr[0,1].set_yscale("log")
-    axarr[1,1].plot(x_histo, hist_worst)
-    #axarr[1,1].set_yscale("log")
+        hist_best, _ = np.histogram(bestseeing["gray"], 64, (0, max_adc_range))
+        hist_worst, _ = np.histogram(worstseeing["gray"], 64, (0, max_adc_range))
 
+        ### display grayscale images
+        f, axarr = plt.subplots(2,2)
+        best_im = bestseeing["gray"]
+        best_im = skimage.exposure.rescale_intensity(best_im, out_range=(0, 255))
+        print("Best blure", bestseeing['blurmetric'])
+        axarr[0,0].imshow(best_im, cmap='gray', vmin=0, vmax=255)
+        worst_img = worstseeing["gray"]
+        worst_img = skimage.exposure.rescale_intensity(worst_img, out_range=(0, 255))
+        print("Worst blure", worstseeing['blurmetric'])
+        axarr[1,0].imshow(worst_img, cmap='gray', vmin=0, vmax=255)
+
+        ### display historgrams
+        x_histo = np.linspace(0, max_adc_range, len(hist_best), endpoint = False)
+        axarr[0,1].plot(x_histo, hist_best)
+        #axarr[0,1].set_yscale("log")
+        axarr[1,1].plot(x_histo, hist_worst)
+        #axarr[1,1].set_yscale("log")
+
+    # sorting is ineffetiv, get blur values to new list
+    blur_value_list = []
     for res in results:
+        blur_value_list.append(res[blur_function])
 
-        # debug output - save all gray scale images as png and name it with the blure metric
-        # stretch the grayscale image to display it later
-        if 0:
+    # sort list inplace
+    blur_value_list.sort(reverse=True if blur_function == "laplace" else False)
+
+    blur_value_list = blur_value_list[:int(round(float(len(blur_value_list)) * manual_quality_settings["store_procent_of_passed_images"] / 100))]
+
+    pool_list = []
+    for res in results:
+        if res[blur_function] in blur_value_list:
+            pool_list.append(res)
+            #results_queue.put(res)
+
+    if 0:
+        for res in results:
+
+            # debug output - save all gray scale images as png and name it with the blure metric
+            # stretch the grayscale image to display it later
+
             gray_image = skimage.exposure.rescale_intensity(res["gray"], out_range=(100, max_adc_range-100))
             try:
-                png_path = '/home/pi/ramdisk/pngs/{:.2f}.png'.format(res["blurmetric"])
+                png_path = '/home/pi/ramdisk/pngs/{:.2f}.png'.format(res[blur_function])
                 plt.imsave(png_path, gray_image, cmap='gray', vmin=0, vmax=max_adc_range)
             except Exception as e:
                 print(e)
 
-        if session["save_image_dng"]:
-            writeDNGFile(res)
-        if session["save_image_fits"]:
-            writeFITSFile(res)
+    len_results = len(results)
+        
+    with Pool(session["num_cpus"]) as p:
+        p.map(storeImages, pool_list)
 
+    # resultslist will be empty here... 
 
-    plt.show()
+    end_time = datetime.timestamp(datetime.now())
+
+    print("{:.1f} images per second blur processed".format(len_results / (end_time - start_time)))
+
+    if MATPLOTLIB_OUTPUT:
+        plt.show()
