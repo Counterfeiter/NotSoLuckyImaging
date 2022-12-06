@@ -20,6 +20,7 @@ from PIL import Image
 from scipy.ndimage import laplace
 from skimage.util.shape import view_as_windows
 from skimage.measure import blur_effect
+from skimage.color import rgb2gray
 import skimage
 from astropy.io import fits
 
@@ -39,23 +40,25 @@ session = {
 
 raw_camera_settings = {
     "size": (1920, 1080),
+    "size_processing": (800, 600),
     "bayerformat": "SRGGB12",
     "bit_depth": 12,
-    "max_fps": 30, #max 60 but short exposure videos get very fast large
+    "max_fps": 60, #max 60 but short exposure videos get very fast large
     "analoggain": (1, 31) # (min, max)
 }
 
 manual_quality_settings = {
-    "store_procent_of_passed_images": 10,
-    "analyse_frames_per_settings": 50,
-    "min_dynamic_range": 40, # %
-    "percentile": (0.1, 99.99),
+    "store_procent_of_passed_images": 1,
+    "analyse_frames_per_settings": 100,
+    "min_dynamic_range": 1, # %
+    # allow three pixels (dead pixels?) to be saturated
+    "percentile": (0.1, 100.0 - 3.0 / (raw_camera_settings["size"][0] * raw_camera_settings["size"][1]) * 100.0),
     #higher is better, no maximum
-    "laplace_threshold": 7.5,
+    "laplace_threshold": 1.0,
     # lower is better, range from 0 to 1.0
     "blur_threshold": None,
-    "use_gains": [2],
-    "use_exposures": [20e3] * 50
+    "use_gains": [5],
+    "use_exposures": [10e3] * 4
 }
 
 config = {
@@ -71,149 +74,94 @@ max_adc_range = 2**raw_camera_settings["bit_depth"] - 1
 pixel_cnt = raw_camera_settings["size"][0] * raw_camera_settings["size"][1]
 
 
-def stride_conv_strided(arr):
-
-    # convolution to debayer to grayscale with 1/4 resolution
-    arr2 = np.array([[0.2989, 0.5870/2],
-                    [0.5870/2, 0.1140]])
-
-    s = 2
-
-    def strided4D(arr, arr2, s):
-        return view_as_windows(arr, arr2.shape, step=s)
-
-    arr4D = strided4D(arr,arr2,s=s)
-    return np.tensordot(arr4D, arr2, axes=((2,3),(0,1)))
-
-def read_raw_video(video_queue, video_path_queue):
-
-    while True:
-
-        tmp_video_path, threshold, metric = video_path_queue.get()
-
-        if tmp_video_path == None:
-            for _ in range(session["num_cpus"]):
-                try:
-                    video_queue.put( (None, None, None) )
-                except:
-                    print("Send exit command failed")
-
-            print("Close video reader process - work done")
-            sys.exit(0)
-
-        try:
-            with open(tmp_video_path, "rb") as file_p:
-                for i in range(manual_quality_settings["analyse_frames_per_settings"] + 1):
-                    try:
-                        buf = file_p.read(pixel_cnt * 2)
-                    except:
-                        break # end of file reached
-                    else:
-                        # discard the first frame - possible other settings
-                        if i == 0: 
-                            continue
-                        
-                        if i > manual_quality_settings["analyse_frames_per_settings"]:
-                            break
-
-                        video_queue.put( (buf, threshold, metric) )
-
-        except Exception as e:
-            print(e)
-            continue # we have problems to open the file
-        finally:
-            st = datetime.timestamp(datetime.now())
-            # delete raw file to free memory
-            os.remove(tmp_video_path)
-            if PRINT_TIME_PROFILING:
-                print("remove video", datetime.timestamp(datetime.now()) - st)
-
-
 def process_raw_video(video_queue, results):
 
     while True:
+        #st = datetime.timestamp(datetime.now())
+        for buf, gray, threshold, metric in video_queue.get():
+            #if PRINT_TIME_PROFILING:
+            #    print("video_queue.get", datetime.timestamp(datetime.now()) - st)
 
-        buf, threshold, metric = video_queue.get()
+            if buf is None:
+                print("Close thread - work done")
+                sys.exit(0)
 
-        if buf == None:
-            print("Close thread - work done")
-            sys.exit(0)
+            try:
+                arr = np.frombuffer(buf, dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0]))
+                arr_rgb = np.frombuffer(gray, dtype=np.uint8).reshape((raw_camera_settings["size_processing"][1], raw_camera_settings["size_processing"][0], 3))
+            except Exception as e:
+                print(e)
+                continue
 
-        try:
-            arr = np.frombuffer(buf, dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0]))
-        except Exception as e:
-            print(e)
-            continue
-
-        st = datetime.timestamp(datetime.now())
-        min_value, max_value = np.percentile(arr, manual_quality_settings["percentile"])
-        if PRINT_TIME_PROFILING:
-            print("percentile", datetime.timestamp(datetime.now()) - st)
-
-        range_percent = (max_value - min_value) / max_adc_range * 100
-
-        if range_percent < manual_quality_settings["min_dynamic_range"]:
-            print("Low dynamic range (min {:.1f}, max {:.1f}) detected - skip". format(min_value, max_value))
-            continue
-
-        if max_value >= max_adc_range:
-            print("Sensor saturation - skip")
-            continue
-        
-        st = datetime.timestamp(datetime.now())
-        # convert bayer to grayscale with convolution - there is no fancy debayer algo. ongoing
-        gray_image = stride_conv_strided(arr)
-
-        if PRINT_TIME_PROFILING:
-            print("stride_conv_strided", datetime.timestamp(datetime.now()) - st)
-
-        image_passed = True
-        laplaceout = None
-        blur_metric = None
-
-        # first blure test option - laplace kernel
-        if manual_quality_settings["laplace_threshold"] is not None:
             st = datetime.timestamp(datetime.now())
-            laplaceout = np.std(laplace(gray_image))
-            if laplaceout < manual_quality_settings["laplace_threshold"]:
-                image_passed = False
+            min_value, max_value = np.percentile(arr, manual_quality_settings["percentile"])
+            if PRINT_TIME_PROFILING:
+                print("percentile", datetime.timestamp(datetime.now()) - st)
+
+            range_percent = (max_value - min_value) / max_adc_range * 100
+
+            if range_percent < manual_quality_settings["min_dynamic_range"]:
+                print("Low dynamic range (min {:.1f}, max {:.1f}) detected - skip". format(min_value, max_value))
+                continue
+
+            if max_value >= max_adc_range:
+                print("Sensor saturation - skip")
+                continue
+            
+            st = datetime.timestamp(datetime.now())
+            # convert bayer to grayscale with convolution - there is no fancy debayer algo. ongoing
+            gray_image = rgb2gray(arr_rgb.astype(np.float32))#stride_conv_strided(arr)
 
             if PRINT_TIME_PROFILING:
-                print("np.std(laplace)", datetime.timestamp(datetime.now()) - st)
+                print("rgb2gray", datetime.timestamp(datetime.now()) - st)
 
-        # second blure test option - skikit image
-        if manual_quality_settings["blur_threshold"] is not None:
-            st = datetime.timestamp(datetime.now())
-            blur_metric = blur_effect(gray_image)
-            if blur_metric > manual_quality_settings["blur_threshold"]:
-                image_passed = False
-            if PRINT_TIME_PROFILING:
-                print("blur_effect", datetime.timestamp(datetime.now()) - st)
+            image_passed = True
+            laplaceout = None
+            blur_metric = None
 
-        blur_str = "{:.3f}".format(blur_metric) if blur_metric is not None else "None"
-        laplace_str = "{:.1f}".format(laplaceout) if laplaceout is not None else "None"
+            # first blure test option - laplace kernel
+            if manual_quality_settings["laplace_threshold"] is not None:
+                st = datetime.timestamp(datetime.now())
+                laplaceout = np.std(laplace(gray_image))
+                if laplaceout < manual_quality_settings["laplace_threshold"]:
+                    image_passed = False
 
-        print("Min: {:.0f} Max: {:.0f}, Laplace: {} Blur: {} {}".format(min_value, max_value , 
-                    laplace_str, blur_str, "*" if image_passed else ""))
+                if PRINT_TIME_PROFILING:
+                    print("np.std(laplace)", datetime.timestamp(datetime.now()) - st)
 
-        out = {
-            "config" : config,
-            "min" : min_value,
-            "max" : max_value,
-            "laplace" : -laplaceout if laplaceout is not None else laplaceout,
-            "blurmetric" : blur_metric,
-            "pass" : image_passed,
-            "ts" : datetime.now()
-        }
-        # send calulated results to main thread
-        results.put(out)
+            # second blure test option - skikit image
+            if manual_quality_settings["blur_threshold"] is not None:
+                st = datetime.timestamp(datetime.now())
+                blur_metric = blur_effect(gray_image)
+                if blur_metric > manual_quality_settings["blur_threshold"]:
+                    image_passed = False
+                if PRINT_TIME_PROFILING:
+                    print("blur_effect", datetime.timestamp(datetime.now()) - st)
 
-        if image_passed:
-            print(out[metric], " <=", threshold)
-            if out[metric] <= threshold:
-                out["gray"] = gray_image
-                out["raw"] = arr
-                storeImages(out)
+            blur_str = "{:.3f}".format(blur_metric) if blur_metric is not None else "None"
+            laplace_str = "{:.1f}".format(laplaceout) if laplaceout is not None else "None"
+
+            print("Min: {:.0f} Max: {:.0f}, Laplace: {} Blur: {} {}".format(min_value, max_value , 
+                        laplace_str, blur_str, "*" if image_passed else ""))
+
+            out = {
+                "config" : config,
+                "min" : min_value,
+                "max" : max_value,
+                "laplace" : -laplaceout if laplaceout is not None else laplaceout,
+                "blurmetric" : blur_metric,
+                "pass" : image_passed,
+                "ts" : datetime.now()
+            }
+            # send calulated results to main thread
+            results.put(out)
+
+            if image_passed:
+                print(out[metric], " <=", threshold)
+                if out[metric] <= threshold:
+                    out["gray"] = gray_image
+                    out["raw"] = arr
+                    storeImages(out)
 
 def storeImages(res):
     st = datetime.timestamp(datetime.now())
@@ -284,33 +232,43 @@ def writeFITSFile(res_dict):
 
     print(filename_fits + " saved!")
 
+# def rgb2gray(rgb):
+#     return np.dot(rgb[...,:3], [0.2989, 0.5870, 0.1140])
+
 if __name__ == "__main__":
 
     # create a thread save list for the results
     results_queue = Queue()
-    video_queue = Queue(session["num_cpus"])
-    video_path_queue = Queue(3)
+    video_queue = Queue(session["num_cpus"] * 5)
+    # video_path_queue = Queue(3)
     blur_quality_list = deque([0.0], maxlen=1000)
     images_processed = 0
 
     # init camera device
     picam2 = Picamera2()
-    video_config = picam2.create_video_configuration(raw={"format": raw_camera_settings["bayerformat"], 'size': raw_camera_settings["size"]})
+    video_config = picam2.create_video_configuration(
+                            main={"size": raw_camera_settings["size_processing"], "format": "RGB888"},
+                            raw={"format": raw_camera_settings["bayerformat"], 'size': raw_camera_settings["size"]})
     picam2.configure(video_config)
     picam2.encode_stream_name = "raw"
     encoder = Encoder()
+    
 
     procs = []
     for _ in range(session["num_cpus"]):
         procs.append(Process(target=process_raw_video, args=(video_queue, results_queue)))
         procs[-1].start()
 
-    sample_video = Process(target=read_raw_video, args=(video_queue, video_path_queue))
-    sample_video.start()
+    # sample_video_procs = []
+    # for _ in range(session["num_cpus"]):
+    #     sample_video_procs.append(Process(target=read_raw_video, args=(video_queue, video_path_queue)))
+    #     sample_video_procs[-1].start()
 
     start_time = datetime.timestamp(datetime.now())
 
     results = []
+
+    buffer_img = []
 
     blur_function = "blurmetric" if manual_quality_settings["blur_threshold"] is not None else "laplace"
 
@@ -332,28 +290,63 @@ if __name__ == "__main__":
             tmp_pts_path = os.path.join(session["tmp_folder"], "timestamp.txt")
 
             picam2.set_controls(config)
+            time.sleep(0.4)
+
+            try:
+                picam2.start()
+            except:
+                continue
+            st = datetime.timestamp(datetime.now())
+            for i in range(manual_quality_settings["analyse_frames_per_settings"] + 1):
+                buf, meta_data = picam2.capture_buffers(["raw", "main"])
+                if i == 0:
+                    continue
+                #arr = np.frombuffer(buf[0], dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0]))
+                #arr_rgb = np.frombuffer(buf[1], dtype=np.uint8).reshape((raw_camera_settings["size_processing"][1], raw_camera_settings["size_processing"][0], 3))
+                #arr_gray = rgb2gray(arr_rgb)
+
+            # print("FPS", 100.0 / (datetime.timestamp(datetime.now()) - st) )
+            # print(arr.shape, len(buf[1]))
+            # print(meta_data)
+
+            # plt.imshow(arr_gray, cmap='gray')
+            # plt.show()
+
+            # exit()
             # we need this delay to give the libcamera driver some time for the next record
             # else we see an IO error
-            time.sleep(0.5)
-            picam2.start_recording(encoder, tmp_video_path, pts=tmp_pts_path)
-            # for small exposures record min two seconds to grab enouth frames
-            time.sleep(max(2, (manual_quality_settings["analyse_frames_per_settings"] + 2) * 1/fps_exposure))
-            picam2.stop_recording()
+            # time.sleep(0.5)
+            # picam2.start_recording(encoder, tmp_video_path, pts=tmp_pts_path)
+            # # for small exposures record min two seconds to grab enouth frames
+            # time.sleep(max(2, (manual_quality_settings["analyse_frames_per_settings"] + 2) * 1/fps_exposure))
+            # picam2.stop_recording()
 
-            while True:
-                try:
-                    blur_quality_list.append(results_queue.get(block = False)[blur_function])
-                    images_processed += 1
-                except queue.Empty:
-                    break
+                while True:
+                    try:
+                        blur_quality_list.append(results_queue.get(block = False)[blur_function])
+                        images_processed += 1
+                    except queue.Empty:
+                        break
 
-            new_threshold = np.percentile(np.array(blur_quality_list), manual_quality_settings["store_procent_of_passed_images"])
+                new_threshold = np.percentile(np.array(blur_quality_list), manual_quality_settings["store_procent_of_passed_images"])
 
-            video_path_queue.put( (tmp_video_path, new_threshold, blur_function) )
+                #print(video_queue.qsize())
+
+                buffer_img.append( (buf[0], buf[1], new_threshold, blur_function) )
+                if len(buffer_img) > 3:
+                    video_queue.put( buffer_img )
+                    buffer_img = []
+            #   video_path_queue.put( (tmp_video_path, new_threshold, blur_function) )
+
+            picam2.stop()
             
     
-    video_path_queue.put( (None, None, None) )
+    for _ in range(len(procs)):
+        video_queue.put( [(None, None, None, None)] )
 
+    # for proc in sample_video_procs:
+    #     proc.join()
+        
     #wait for all ongoing threads
     for proc in procs:
         # workaround to avoid hanging queue because of the large size used here
