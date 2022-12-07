@@ -9,6 +9,9 @@ import __main__ as main
 import atexit
 from collections import deque # not process save
 
+from astropy.stats import sigma_clipped_stats
+from photutils.detection import DAOStarFinder
+
 #camera functions
 from picamera2 import Picamera2
 from picamera2.encoders import Encoder
@@ -41,21 +44,22 @@ raw_camera_settings = {
     "size": (1920, 1080),
     "bayerformat": "SRGGB12",
     "bit_depth": 12,
-    "max_fps": 30, #max 60 but short exposure videos get very fast large
+    "max_fps": 30, #max 60 but short exposure videos get very fast large (~4 MB per Frame)
     "analoggain": (1, 31) # (min, max)
 }
 
 manual_quality_settings = {
-    "store_procent_of_passed_images": 10,
+    "store_procent_of_passed_images": 2,
     "analyse_frames_per_settings": 50,
-    "min_dynamic_range": 40, # %
-    "percentile": (0.1, 99.99),
+    "min_dynamic_range": 2, # %
+    "percentile": (0.1, 99.9998), # ~ 4 dead pixels at max
     #higher is better, no maximum
-    "laplace_threshold": 7.5,
+    "laplace_threshold": 7.0,
     # lower is better, range from 0 to 1.0
     "blur_threshold": None,
+    "starfinder_threshold": None,
     "use_gains": [2],
-    "use_exposures": [20e3] * 50
+    "use_exposures": [20e3] * 20
 }
 
 config = {
@@ -170,6 +174,28 @@ def process_raw_video(video_queue, results):
         image_passed = True
         laplaceout = None
         blur_metric = None
+        star_quality = 0.0
+
+        if manual_quality_settings["starfinder_threshold"] is not None:
+            st = datetime.timestamp(datetime.now())
+            mean, median, std = sigma_clipped_stats(gray_image, sigma=3.0)
+            daofind = DAOStarFinder(fwhm=3.0, threshold=5.*std, exclude_border=True, brightest=10, 
+                                    peakmax=2**raw_camera_settings["bit_depth"]-1)
+            try:
+                sources = daofind(gray_image - median)
+            except:
+                pass # error if no stars are found
+            else:
+                if sources is not None:
+                    mean = 0.0
+                    for src in sources:
+                        mean += src["sharpness"]
+
+                    if len(sources) > 0:
+                        star_quality = mean / len(sources)
+
+            if PRINT_TIME_PROFILING:
+                print("DAOStarFinder", datetime.timestamp(datetime.now()) - st)
 
         # first blure test option - laplace kernel
         if manual_quality_settings["laplace_threshold"] is not None:
@@ -190,18 +216,20 @@ def process_raw_video(video_queue, results):
             if PRINT_TIME_PROFILING:
                 print("blur_effect", datetime.timestamp(datetime.now()) - st)
 
+        star_string = "{:.3f}".format(star_quality)
         blur_str = "{:.3f}".format(blur_metric) if blur_metric is not None else "None"
         laplace_str = "{:.1f}".format(laplaceout) if laplaceout is not None else "None"
 
-        print("Min: {:.0f} Max: {:.0f}, Laplace: {} Blur: {} {}".format(min_value, max_value , 
-                    laplace_str, blur_str, "*" if image_passed else ""))
+        print("Min: {:.0f} Max: {:.0f}, Laplace: {} Blur: {} Starsharpness: {} {}".format(min_value, max_value , 
+                    laplace_str, blur_str, star_string, "*" if image_passed else ""))
 
         out = {
             "config" : config,
             "min" : min_value,
             "max" : max_value,
-            "laplace" : -laplaceout if laplaceout is not None else laplaceout,
+            "laplace" : laplaceout,
             "blurmetric" : blur_metric,
+            "starquality" : star_quality,
             "pass" : image_passed,
             "ts" : datetime.now()
         }
@@ -209,19 +237,30 @@ def process_raw_video(video_queue, results):
         results.put(out)
 
         if image_passed:
-            print(out[metric], " <=", threshold)
-            if out[metric] <= threshold:
+            print(out[metric], " <=> ", threshold)
+
+            # check if given function marks image as storeable
+            if metric == "laplace" or metric == "starquality":
+                if out[metric] <= threshold:
+                    image_passed = False
+            elif metric == "blurmetric":
+                if out[metric] >= threshold:
+                    image_passed = False
+            else:
+                image_passed = False
+            
+            if image_passed:
                 out["gray"] = gray_image
                 out["raw"] = arr
-                storeImages(out)
+                storeImages(out, metric)
 
-def storeImages(res):
+def storeImages(res, metric):
     st = datetime.timestamp(datetime.now())
 
     if session["save_image_dng"]:
-        writeDNGFile(res)
+        writeDNGFile(res, metric)
     if session["save_image_fits"]:
-        writeFITSFile(res)
+        writeFITSFile(res, metric)
 
     if PRINT_TIME_PROFILING:
         print("store raw files", datetime.timestamp(datetime.now()) - st)
@@ -229,7 +268,7 @@ def storeImages(res):
     return 0
 
 
-def writeDNGFile(res_dict):
+def writeDNGFile(res_dict, metric):
     # we take this from capture_video_raw example
     # Create DNG file from frame, based on https://github.com/schoolpost/PiDNG/blob/master/examples/raw2dng.py
     r = RAW2DNG()
@@ -248,18 +287,16 @@ def writeDNGFile(res_dict):
     t.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
     t.set(Tag.Model, "IMX290C")
     r.options(t, path="", compress=False)
-    blur_function = "blurmetric" if res_dict["blurmetric"] is not None else "laplace"
     filename_dng = "{:.3f}_{}_G{:02d}_E{:04d}_{:f}".format(
-        res_dict[blur_function], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
+        res_dict[metric], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
         int(res_dict["config"]["ExposureTime"] // 1000), datetime.timestamp(res_dict["ts"]))
     r.convert(res_dict["raw"], filename=os.path.join(session["img_folder"], filename_dng ) )
     
     print(filename_dng + " saved!")
 
-def writeFITSFile(res_dict):
-    blur_function = "blurmetric" if res_dict["blurmetric"] is not None else "laplace"
+def writeFITSFile(res_dict, metric):
     filename_fits = "{:.3f}_{}_G{:02d}_E{:04d}_{:f}.fits".format(
-        res_dict[blur_function], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
+        res_dict[metric], session["object_name"], int(res_dict["config"]["AnalogueGain"]), 
         int(res_dict["config"]["ExposureTime"] // 1000), datetime.timestamp(res_dict["ts"]))
 
     hdu = fits.PrimaryHDU(data=res_dict["raw"])
@@ -290,7 +327,6 @@ if __name__ == "__main__":
     results_queue = Queue()
     video_queue = Queue(session["num_cpus"])
     video_path_queue = Queue(3)
-    blur_quality_list = deque([0.0], maxlen=1000)
     images_processed = 0
 
     # init camera device
@@ -312,7 +348,24 @@ if __name__ == "__main__":
 
     results = []
 
-    blur_function = "blurmetric" if manual_quality_settings["blur_threshold"] is not None else "laplace"
+    persentile_side = manual_quality_settings["store_procent_of_passed_images"]
+    if manual_quality_settings["starfinder_threshold"] is not None:
+        blur_function = "starquality" #highest prio
+        #sharper is greater
+        persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
+        blur_quality_list = deque([0.0], maxlen=1000)
+    elif manual_quality_settings["blur_threshold"] is not None:
+        blur_function = "blurmetric"
+        #sharper goes positiv to zero
+        persentile_side = manual_quality_settings["store_procent_of_passed_images"]
+        blur_quality_list = deque([1.0], maxlen=1000)
+    elif manual_quality_settings["laplace_threshold"] is not None:
+        blur_function = "laplace"
+        #sharper is greater
+        persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
+        blur_quality_list = deque([manual_quality_settings["laplace_threshold"]], maxlen=1000)
+    
+        
 
     for gain in manual_quality_settings["use_gains"]:
         for exposure in manual_quality_settings["use_exposures"]:
@@ -335,7 +388,11 @@ if __name__ == "__main__":
             # we need this delay to give the libcamera driver some time for the next record
             # else we see an IO error
             time.sleep(0.5)
-            picam2.start_recording(encoder, tmp_video_path, pts=tmp_pts_path)
+            try:
+                picam2.start_recording(encoder, tmp_video_path, pts=tmp_pts_path)
+            except Exception as e:
+                print(e)
+                continue
             # for small exposures record min two seconds to grab enouth frames
             time.sleep(max(2, (manual_quality_settings["analyse_frames_per_settings"] + 2) * 1/fps_exposure))
             picam2.stop_recording()
@@ -347,7 +404,7 @@ if __name__ == "__main__":
                 except queue.Empty:
                     break
 
-            new_threshold = np.percentile(np.array(blur_quality_list), manual_quality_settings["store_procent_of_passed_images"])
+            new_threshold = np.percentile(np.array(blur_quality_list), persentile_side)
 
             video_path_queue.put( (tmp_video_path, new_threshold, blur_function) )
             
@@ -411,43 +468,6 @@ if __name__ == "__main__":
         #axarr[1,1].set_yscale("log")
 
     st = datetime.timestamp(datetime.now())
-
-    # sorting is ineffetiv, get blur values to new list
-    # blur_value_list = []
-    # for res in results:
-    #     blur_value_list.append(res[blur_function])
-
-    # # sort list inplace
-    # blur_value_list.sort(reverse=True if blur_function == "laplace" else False)
-
-    # blur_value_list = blur_value_list[:int(round(float(len(blur_value_list)) * manual_quality_settings["store_procent_of_passed_images"] / 100))]
-
-    # pool_list = []
-    # for res in results:
-    #     if res[blur_function] in blur_value_list:
-    #         pool_list.append(res)
-    #         #results_queue.put(res)
-
-    # if PRINT_TIME_PROFILING:
-    #     print("sorting for pool job", datetime.timestamp(datetime.now()) - st)
-
-    # if 0:
-    #     for res in results:
-
-    #         # debug output - save all gray scale images as png and name it with the blure metric
-    #         # stretch the grayscale image to display it later
-
-    #         gray_image = skimage.exposure.rescale_intensity(res["gray"], out_range=(100, max_adc_range-100))
-    #         try:
-    #             png_path = '/home/pi/ramdisk/pngs/{:.2f}.png'.format(res[blur_function])
-    #             plt.imsave(png_path, gray_image, cmap='gray', vmin=0, vmax=max_adc_range)
-    #         except Exception as e:
-    #             print(e)
-
-    # len_results = len(results)
-        
-    # with Pool(session["num_cpus"]) as p:
-    #     p.map(storeImages, pool_list)
 
     # resultslist will be empty here... 
     end_time = datetime.timestamp(datetime.now())

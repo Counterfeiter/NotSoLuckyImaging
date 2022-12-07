@@ -8,3 +8,4 @@ PyQt5-sip==12.8.1
 scikit-image==0.19.3
 scipy==1.9.3
 astropy==5.1.1
+photutils==1.5.0
