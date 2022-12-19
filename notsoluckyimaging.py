@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-import time, os, signal, sys, glob
+import time, os, signal, sys, glob, re
 import numpy as np
 from datetime import datetime
 from multiprocessing import Process, Pool, Queue
@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import __main__ as main
 import atexit
 from collections import deque # not process save
+import subprocess
 
 from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder
@@ -35,7 +36,8 @@ session = {
     "save_image_fits" : True,
     #"img_folder": "/home/pi/luckyimaging/",
     "img_folder" : "/media/pi/LOG_DONGLE/",
-    "num_cpus": 4,
+    "tmp_folder" : "/tmp/",
+    "num_cpus": 1,
     "images_per_process": 1
 }
 
@@ -44,21 +46,40 @@ raw_camera_settings = {
     "size_processing": (800, 600),
     "bayerformat": "SRGGB12",
     "bit_depth": 12,
-    "max_fps": 30, #max 60 but short exposure videos get very fast large (~4 MB per Frame)
+    "max_fps": 60,
     "analoggain": (1, 31) # (min, max)
 }
 
 manual_quality_settings = {
     "store_procent_of_passed_images": 1,
-    "analyse_frames_per_settings": 20,
+    "analyse_frames_per_settings": 10,
     "min_dynamic_range": 1, # %
     # allow three pixels (dead pixels?) to be saturated
     "percentile": (0.1, 100.0 - 3.0 / (raw_camera_settings["size"][0] * raw_camera_settings["size"][1]) * 100.0),
     #higher is better, no maximum
-    "laplace_threshold": 1.0,
+    "laplace_threshold": None,
     # lower is better, range from 0 to 1.0
     "blur_threshold": None,
-    "starfinder_threshold": None,
+    "starfinder": {
+        "threshold" : 1.0,
+        "platesolve" : True,
+
+        "path_exec_solvefield": "/usr/bin/solve-field",
+        # faster plate solving if given 
+        #"ra" : "05:41:03",
+        "ra" : "",
+        #"dec" : "-01:55:06",
+        "dec" : "",
+        "scale" : 
+        {
+            "enabled" : True,
+            "unit" : "arcsecperpix", # or "arcsecperpix" or "arcminwidth"
+            "low" : 17.0,
+            "high" : 18.1
+        },
+        #limit time to spend on plate solving the images
+        "cputime" : 10 # sec
+    },
     "use_gains": [14], # unity gain at about 11, use > 14 to have lower read noise
     "use_exposures": [10e3] * 1
 }
@@ -77,7 +98,48 @@ pixel_cnt = raw_camera_settings["size"][0] * raw_camera_settings["size"][1]
 
 picamera_setsaveexit = None
 
-def process_frames(video_queue, results):
+def calc_polar_alignment_err(axis_drift_arc_sec, axis_pointed, timedelta_min):
+    # (timedelta * cos(phi) * axis_drift * 3600 ) / 4
+
+    # return is position error in arc minutes
+    return 12.0/np.pi * axis_drift_arc_sec/ (timedelta_min * np.cos(axis_pointed))
+
+def solvefield_out_to_coord(out):
+    ret = {
+        "ra": None,
+        "dec": None,
+        "wcs": None
+    }
+    for line in out.decode("utf-8").split("\n"):
+        # split at ( and  )
+        line_sp = re.split(r"[\(\)]", line)
+        #print(line_sp)
+        if len(line_sp) > 4 and \
+            "Field center:" in line_sp[0] and \
+            "deg." in line_sp[4]:
+            radec = line_sp[3].split(", ")
+            try:
+                ret["ra"] = float(radec[0])
+                ret["dec"] = float(radec[1])
+            except:
+                pass
+        
+        # split at whitespaces
+        line_sp = line.split(":")
+        if len(line_sp) >= 2 and "Field rotation angle" in line_sp[0]:
+            for word in line_sp[1].split(" "):
+                try:
+                    ret["wcs"] = float(word)
+                except:                                        
+                    pass
+
+    for key, value in ret.items():
+        if value is None:
+            return None
+    
+    return ret # all coordinates could be parsed
+
+def process_frames(process_id, video_queue, results):
 
     while True:
         #st = datetime.timestamp(datetime.now())
@@ -113,6 +175,9 @@ def process_frames(video_queue, results):
             if PRINT_TIME_PROFILING:
                 print("rgb2gray", datetime.timestamp(datetime.now()) - st)
 
+            plt.imshow(gray_image)
+            plt.show()
+
             image_passed = True
             laplaceout = None
             blur_metric = None
@@ -134,23 +199,61 @@ def process_frames(video_queue, results):
                 if PRINT_TIME_PROFILING:
                     print("blur_effect", datetime.timestamp(datetime.now()) - st)
 
-            if manual_quality_settings["starfinder_threshold"] is not None:
+            pos_dict = None
+            if manual_quality_settings["starfinder"]["threshold"] is not None:
                 st = datetime.timestamp(datetime.now())
                 mean, median, std = sigma_clipped_stats(gray_image, sigma=3.0)
-                daofind = DAOStarFinder(fwhm=3.0, threshold=5.*std, exclude_border=True, brightest=10, 
-                                        peakmax=2**raw_camera_settings["bit_depth"]-1)
+                daofind = DAOStarFinder(fwhm=3.0, threshold=2.5*std, exclude_border=True)
                 try:
                     sources = daofind(gray_image - median)
                 except:
                     pass # error if no stars are found
                 else:
                     if sources is not None:
+                        sources = np.sort(sources, order="mag")[::-1]
                         mean = 0.0
-                        for src in sources:
+                        #print(sources)
+                        for src in sources[:10]:
                             mean += src["sharpness"]
+                            
 
                         if len(sources) > 0:
                             star_quality = mean / len(sources)
+
+                        print("{} stars found in image!".format(len(sources)))
+
+                        if manual_quality_settings["starfinder"]["platesolve"]:
+                            hdul = fits.HDUList()
+                            hdul.append(fits.PrimaryHDU())
+                            hdul.append(fits.BinTableHDU(sources))
+                            xyfitsfilepath = os.path.join(session["tmp_folder"], "solver_{}.xyls".format(str(process_id)))
+                            hdul.writeto(xyfitsfilepath, overwrite=True)
+
+                            sub_proc_call_str = ("solve-field \"{}\" -D \"{}\" --continue --overwrite --no-plots -w {:d} -e {:d} -X xcentroid -Y " + \
+                                                "ycentroid -s mag --cpulimit {}").format(
+                                                        xyfitsfilepath, session["tmp_folder"],
+                                                        gray_image.shape[1], gray_image.shape[0],
+                                                        str(manual_quality_settings["starfinder"]["cputime"])
+                                                        )
+                            if manual_quality_settings["starfinder"]["ra"]:
+                                sub_proc_call_str += " --ra {}".format(manual_quality_settings["starfinder"]["ra"])
+                            if manual_quality_settings["starfinder"]["dec"]:
+                                sub_proc_call_str += " --dec {}".format(manual_quality_settings["starfinder"]["dec"])
+                            sub_proc_call_arr = sub_proc_call_str.split(" ")
+
+                            if manual_quality_settings["starfinder"]["scale"]["enabled"]:
+                                sub_proc_call_str += " -L {}".format(manual_quality_settings["starfinder"]["scale"]["low"])
+                                sub_proc_call_str += " -H {}".format(manual_quality_settings["starfinder"]["scale"]["high"])
+                                sub_proc_call_str += " -u {}".format(manual_quality_settings["starfinder"]["scale"]["unit"])
+
+                            #print(sub_proc_call_str)
+
+                            proc = subprocess.Popen(sub_proc_call_str, shell=True, stdout=subprocess.PIPE)
+                            out, err = proc.communicate()
+                            #print(out)
+                            pos_dict = solvefield_out_to_coord(out)
+
+                            #print(pos_dict)
 
                 if PRINT_TIME_PROFILING:
                     print("DAOStarFinder", datetime.timestamp(datetime.now()) - st)
@@ -170,8 +273,15 @@ def process_frames(video_queue, results):
                 "blurmetric" : blur_metric,
                 "starquality" : star_quality,
                 "pass" : image_passed,
-                "ts" : datetime.now()
+                "ts" : datetime.now(),
             }
+
+            if pos_dict:
+                out["coords"] = pos_dict
+
+            if results is None:
+                print(out)
+                return
             # send calulated results to main thread
             results.put(out)
 
@@ -260,10 +370,15 @@ def writeFITSFile(res_dict, metric):
 
     print(filename_fits + " saved!")
 
+cnt_exits = 0
 def ctlC_handler(signum, frame):
     global picamera_setsaveexit
+    global cnt_exits
     print("Exit by Crtl + C requested... ")
     picamera_setsaveexit = True
+    cnt_exits += 1
+    if cnt_exits > 2:
+        exit(1) # mybe the libcamera driver will fail in the next call
 
 if __name__ == "__main__":
     picamera_setsaveexit = False
@@ -276,6 +391,25 @@ if __name__ == "__main__":
     blur_quality_list = deque([0.0], maxlen=1000)
     images_processed = 0
 
+    if len(sys.argv) > 1:
+        test_file = sys.argv[1]
+        test_img = skimage.io.imread(test_file).astype(np.uint8)
+        #test_img = np.swapaxes(test_img, 0, 1)
+        if test_img.shape[2] >= 3:
+            test_img = test_img[:,:,:3]
+
+        #plt.imshow(test_img)
+        #plt.show()
+
+        #print(test_img.shape)
+        raw_camera_settings["size_processing"] = (test_img.shape[1], test_img.shape[0]) #trick gray scale image size
+        test_raw = np.ones((raw_camera_settings["size"][1], raw_camera_settings["size"][0]), dtype=np.uint16)
+        raw_camera_settings["min_dynamic_range"] = 0.0 # trick dynamic
+        video_queue.put( [(test_raw.tobytes(), test_img.tobytes(), 1.0, "starquality")] )
+        process_frames(0, video_queue, None)
+
+        exit(0)
+
     # init camera device
     picamera_context = Picamera2()
     video_config = picamera_context.create_video_configuration(
@@ -287,20 +421,22 @@ if __name__ == "__main__":
     
 
     procs = []
-    for _ in range(session["num_cpus"]):
-        procs.append(Process(target=process_frames, args=(video_queue, results_queue)))
+    for i in range(session["num_cpus"]):
+        procs.append(Process(target=process_frames, args=(i, video_queue, results_queue)))
         procs[-1].start()
 
     start_time = datetime.timestamp(datetime.now())
 
     buffer_img = []
 
+
+
     persentile_side = manual_quality_settings["store_procent_of_passed_images"]
-    if manual_quality_settings["starfinder_threshold"] is not None:
+    if manual_quality_settings["starfinder"]["threshold"] is not None:
         blur_function = "starquality" #highest prio
         #sharper is greater
         persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
-        blur_quality_list = deque([manual_quality_settings["starfinder_threshold"]], maxlen=1000)
+        blur_quality_list = deque([manual_quality_settings["starfinder"]["threshold"]], maxlen=1000)
     elif manual_quality_settings["blur_threshold"] is not None:
         blur_function = "blurmetric"
         #sharper goes positiv to zero
@@ -313,7 +449,6 @@ if __name__ == "__main__":
         blur_quality_list = deque([manual_quality_settings["laplace_threshold"]], maxlen=1000)
 
     print("Use metric: " + blur_function + " for image selection decision.")
-    
         
 
     for gain in manual_quality_settings["use_gains"]:
