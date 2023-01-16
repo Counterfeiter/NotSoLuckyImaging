@@ -34,6 +34,8 @@ from astropy.io import fits
 
 PRINT_TIME_PROFILING = False
 
+WEBSERVER_PORT = 8084
+
 session = {
     "object_name": "Jupiter",
     "save_image_dng" : False,
@@ -60,13 +62,14 @@ manual_quality_settings = {
     "min_dynamic_range": 1, # %
     # allow three pixels (dead pixels?) to be saturated
     "percentile": (0.1, 100.0 - 3.0 / (raw_camera_settings["size"][0] * raw_camera_settings["size"][1]) * 100.0),
+    "use_eval_function": "laplace",
     #higher is better, no maximum
-    "laplace_threshold": None,
+    "laplace_threshold": 20,
     # lower is better, range from 0 to 1.0
     "blur_threshold": 1.0,
     "starfinder": {
-        "threshold" : None,
-        "platesolve" : True,
+        "threshold" : 8.0,
+        "platesolve" : False,
 
         "path_exec_solvefield": "/usr/bin/solve-field",
         # faster plate solving if given 
@@ -84,8 +87,8 @@ manual_quality_settings = {
         #limit time to spend on plate solving the images
         "cputime" : 10 # sec
     },
-    "use_gains": [1], # unity gain at about 11, use > 14 to have lower read noise
-    "use_exposures": [10e3] * 1
+    "use_gain": 1, # unity gain at about 11, use > 14 to have lower read noise
+    "use_exposure": 10e3
 }
 
 config = {
@@ -102,12 +105,18 @@ pixel_cnt = raw_camera_settings["size"][0] * raw_camera_settings["size"][1]
 
 picamera_setsaveexit = None
 
+enable_recording = False
+
 processed_images = deque(maxlen=5)
 
 # flask app  
 app = Flask(__name__, template_folder='./templates')
 app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app)
+
+## fix error with max payload
+from engineio.payload import Payload
+Payload.max_decode_packets = 500 #cfg.service.ENGINEIO_MAX_DECODE_PACKETS
+socketio = SocketIO(app, async_mode="threading")
 
 def calc_polar_alignment_err(axis_drift_arc_sec, axis_pointed, timedelta_min):
     # (timedelta * cos(phi) * axis_drift * 3600 ) / 4
@@ -154,13 +163,16 @@ def process_frames(process_id, video_queue, results):
 
     while True:
         #st = datetime.timestamp(datetime.now())
-        for buf, gray, threshold, metric in video_queue.get():
+        for buf, gray, params in video_queue.get():
+
             #if PRINT_TIME_PROFILING:
             #    print("video_queue.get", datetime.timestamp(datetime.now()) - st)
 
             if buf is None:
                 print("Close thread - work done")
                 sys.exit(0)
+
+            threshold, metric = params["threshold"], params["blurfunction"]
 
             try:
                 arr = np.frombuffer(buf, dtype=np.uint16).reshape((raw_camera_settings["size"][1], raw_camera_settings["size"][0]))
@@ -197,15 +209,15 @@ def process_frames(process_id, video_queue, results):
 
                 image_passed = True
 
-                # first blure test option - laplace kernel
-                if manual_quality_settings["laplace_threshold"] is not None:
+                # first blur test option - laplace kernel
+                if metric == "laplace":
                     st = datetime.timestamp(datetime.now())
                     laplaceout = np.std(laplace(gray_image))
                     if laplaceout < manual_quality_settings["laplace_threshold"]:
                         image_passed = False
 
-                # second blure test option - skikit image
-                if manual_quality_settings["blur_threshold"] is not None:
+                # second blur test option - skikit image
+                if metric == "blurmetric":
                     st = datetime.timestamp(datetime.now())
                     blur_metric = blur_effect(gray_image)
                     if blur_metric > manual_quality_settings["blur_threshold"]:
@@ -213,7 +225,7 @@ def process_frames(process_id, video_queue, results):
                     if PRINT_TIME_PROFILING:
                         print("blur_effect", datetime.timestamp(datetime.now()) - st)
 
-                if manual_quality_settings["starfinder"]["threshold"] is not None:
+                if metric == "starquality":
                     st = datetime.timestamp(datetime.now())
                     mean, median, std = sigma_clipped_stats(gray_image, sigma=3.0)
                     daofind = DAOStarFinder(fwhm=3.0, threshold=2.5*std, exclude_border=True)
@@ -303,7 +315,7 @@ def process_frames(process_id, video_queue, results):
             # send calulated results to main thread
             results.put(out)
 
-            if image_passed:
+            if image_passed and params["recording"]:
                 print(out[metric], " <=> ", threshold)
 
                 # check if given function marks image as storeable
@@ -391,20 +403,54 @@ def writeFITSFile(res_dict, metric):
 ##### Flask req. functions
 def send_img_frame_to_webserver():
     while True:
-        # try:
-        byte_io = BytesIO()
-        #print(processed_images[-1]["gray_image"].shape)
-        pil_img = Image.fromarray(np.uint8(processed_images[-1]["gray_image"]), 'L')
-        pil_img.save(byte_io, 'JPEG')
-        yield (b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' + byte_io.getvalue() + b'\r\n')
-        # except Exception as e:
-        #     pass
+        if len(processed_images) > 0:
+            # try:
+            byte_io = BytesIO()
+            #print(processed_images[-1]["gray_image"].shape)
+            pil_img = Image.fromarray(np.uint8(processed_images[-1]["gray_image"]), 'L')
+            pil_img.save(byte_io, 'JPEG')
+            yield (b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n' + byte_io.getvalue() + b'\r\n')
+            # except Exception as e:
+            #     pass
 
-@socketio.on('message')
-def handle_message(data):
-    print('received message: ' + str(data), flush=True)
-    sys.stdout.flush()
+@socketio.on('exposure_input')
+def handle_sio_exposure_input(data):
+    try:
+        manual_quality_settings["use_exposure"] = float(data["value"])
+    except:
+        pass
+    #print('received message: ' + str(data))
+
+@socketio.on('startstop_button')
+def handle_sio_startstop_button(data):
+    global enable_recording
+    try:
+        enable_recording = True if "Start" in data["value"] else False
+    except:
+        pass
+    #print('received message: ' + str(data))
+
+@socketio.on('gain_input')
+def handle_sio_gain_input(data):
+    try:
+        manual_quality_settings["use_gain"] = float(data["value"])
+    except:
+        pass
+    #print('received message: ' + str(data))
+
+@socketio.on('function_selection')
+def handle_sio_function_selection(data):
+    try:
+        if data["value"] == "Laplace":
+            manual_quality_settings["use_eval_function"] = "laplace"
+        elif data["value"] == "StarQuality":
+            manual_quality_settings["use_eval_function"] = "starquality"
+        elif data["value"] == "BlurFunction":
+            manual_quality_settings["use_eval_function"] = "blurmetric"
+    except:
+        pass
+    #print('received message: ' + str(data))
 
 @app.route('/live_feed')
 def live_feed():
@@ -439,7 +485,7 @@ if __name__ == "__main__":
     blur_quality_list = deque([0.0], maxlen=1000)
     images_processed = 0
 
-    threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=8080, use_reloader=False)).start()
+    threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=WEBSERVER_PORT, use_reloader=False)).start()
 
     if len(sys.argv) > 1:
         test_file = sys.argv[1]
@@ -451,23 +497,32 @@ if __name__ == "__main__":
         #plt.imshow(test_img)
         #plt.show()
 
+        params = {
+            "threshold": 1.0,
+            "blurfunction": "blurmetric",
+            "recording": False
+        }
+
         #print(test_img.shape)
         raw_camera_settings["size_processing"] = (test_img.shape[1], test_img.shape[0]) #trick gray scale image size
         test_raw = np.ones((raw_camera_settings["size"][1], raw_camera_settings["size"][0]), dtype=np.uint16)
         raw_camera_settings["min_dynamic_range"] = 0.0 # trick dynamic
-        video_queue.put( [(test_raw.tobytes(), test_img.tobytes(), 1.0, "starquality")] )
+        video_queue.put( [(test_raw.tobytes(), test_img.tobytes(), params)] )
         process_frames(0, video_queue, None)
 
         exit(0)
 
     # init camera device
-    picamera_context = Picamera2()
-    video_config = picamera_context.create_video_configuration(
-                            main={"size": raw_camera_settings["size_processing"], "format": "RGB888"},
-                            raw={"format": raw_camera_settings["bayerformat"], 'size': raw_camera_settings["size"]})
-    picamera_context.configure(video_config)
-    picamera_context.encode_stream_name = "raw"
-    encoder = Encoder()
+    try:
+        picamera_context = Picamera2()
+        video_config = picamera_context.create_video_configuration(
+                                main={"size": raw_camera_settings["size_processing"], "format": "RGB888"},
+                                raw={"format": raw_camera_settings["bayerformat"], 'size': raw_camera_settings["size"]})
+        picamera_context.configure(video_config)
+        picamera_context.encode_stream_name = "raw"
+        encoder = Encoder()
+    except:
+        picamera_context = None
     
 
     procs = []
@@ -482,77 +537,94 @@ if __name__ == "__main__":
 
 
     persentile_side = manual_quality_settings["store_procent_of_passed_images"]
-    if manual_quality_settings["starfinder"]["threshold"] is not None:
-        blur_function = "starquality" #highest prio
-        #sharper is greater
-        persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
-        blur_quality_list = deque([manual_quality_settings["starfinder"]["threshold"]], maxlen=1000)
-    elif manual_quality_settings["blur_threshold"] is not None:
-        blur_function = "blurmetric"
-        #sharper goes positiv to zero
-        persentile_side = manual_quality_settings["store_procent_of_passed_images"]
-        blur_quality_list = deque([1.0], maxlen=1000)
-    elif manual_quality_settings["laplace_threshold"] is not None:
-        blur_function = "laplace"
-        #sharper is greater
-        persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
-        blur_quality_list = deque([manual_quality_settings["laplace_threshold"]], maxlen=1000)
+    blur_function = ""
 
-    print("Use metric: " + blur_function + " for image selection decision.")
+    while picamera_setsaveexit == False:
+        # fps req. for the given expsoure
+        fps_exposure = 1e6 / manual_quality_settings["use_exposure"]
 
-    # fps req. for the given expsoure
-    fps_exposure = 1e6 / manual_quality_settings["use_exposures"][0]
+        # do camera settings
+        config["AnalogueGain"] = int(manual_quality_settings["use_gain"])
+        config["ExposureTime"] = int(manual_quality_settings["use_exposure"])
+        config["FrameRate"] = min(fps_exposure, raw_camera_settings["max_fps"])
 
-    # do camera settings
-    config["AnalogueGain"] = int(manual_quality_settings["use_gains"][0])
-    config["ExposureTime"] = int(manual_quality_settings["use_exposures"][0])
-    config["FrameRate"] = min(fps_exposure, raw_camera_settings["max_fps"])
+        print("Stard video stream with gain: {} and exposure time: {} ms".format(config["AnalogueGain"], config["ExposureTime"] / 1e3))
 
-    print("Stard recording with Gain: {} and Exposure time: {} ms".format(config["AnalogueGain"], config["ExposureTime"] / 1e3))
+        if picamera_context:
+            picamera_context.set_controls(config)
+            time.sleep(0.4)
 
-    picamera_context.set_controls(config)
-    time.sleep(0.4)
+            picamera_context.start()
 
-    # try:
-    picamera_context.start()
-    # except:
-    #     continue
-        
+        while picamera_setsaveexit == False:
+            socketio.sleep(0.01) # yield
 
-    while True:
-        socketio.sleep(0.01) # yield
+            if blur_function != manual_quality_settings["use_eval_function"]:
+                if manual_quality_settings["use_eval_function"] == "starquality":
+                    #sharper is greater
+                    persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
+                    blur_quality_list = deque([manual_quality_settings["starfinder"]["threshold"]], maxlen=1000)
+                elif manual_quality_settings["use_eval_function"] == "blurmetric":
+                    #sharper goes positiv to zero
+                    persentile_side = manual_quality_settings["store_procent_of_passed_images"]
+                    blur_quality_list = deque([1.0], maxlen=1000)
+                elif manual_quality_settings["use_eval_function"] == "laplace":
+                    #sharper is greater
+                    persentile_side = 100.0 - manual_quality_settings["store_procent_of_passed_images"]
+                    blur_quality_list = deque([manual_quality_settings["laplace_threshold"]], maxlen=1000)
 
-        st = datetime.timestamp(datetime.now())
+                blur_function = manual_quality_settings["use_eval_function"]
+                
+                print("Use metric: " + blur_function + " for image selection decision.")
 
-        buf, meta_data = picamera_context.capture_buffers(["raw", "main"])
-        # first image has sometimes not the desired settings
-        if i == 0:
-            continue
-
-        while True:
-            try:
-                processed_images.append(results_queue.get(block = False))
-                if not processed_images[-1]["saturation"]:
-                    blur_quality_list.append(processed_images[-1][blur_function])
-                    images_processed += 1
-            except queue.Empty:
+            if int(manual_quality_settings["use_gain"]) != config["AnalogueGain"] or \
+                int(manual_quality_settings["use_exposure"]) != config["ExposureTime"]:
                 break
 
-        new_threshold = np.percentile(np.array(blur_quality_list), persentile_side)
+            st = datetime.timestamp(datetime.now())
 
-        buffer_img.append( (buf[0], buf[1], new_threshold, blur_function) )
-        if len(buffer_img) >= session["images_per_process"]:
-            video_queue.put( buffer_img )
-            buffer_img = []
+            if picamera_context:
+                buf, meta_data = picamera_context.capture_buffers(["raw", "main"])
+            else:
+                continue
 
-        if picamera_setsaveexit:
-            break
+            while True:
+                try:
+                    processed_images.append(results_queue.get(block = False))
+                    if not processed_images[-1]["saturation"]:
+                        try:
+                            blur_quality_list.append(processed_images[-1][blur_function])
+                        except:
+                            pass
+                        images_processed += 1
+                except queue.Empty:
+                    break
 
-    picamera_context.stop()
+            new_threshold = np.percentile(np.array(blur_quality_list), persentile_side)
+
+            params = {
+                "threshold": new_threshold,
+                "blurfunction": blur_function,
+                "recording": enable_recording
+            }
+
+            buffer_img.append( (buf[0], buf[1], params) )
+            if len(buffer_img) >= session["images_per_process"]:
+                try:
+                    video_queue.put( buffer_img, timeout=1 )
+                    buffer_img = []
+                except:
+                    pass
+
+            if picamera_setsaveexit:
+                break
+
+        if picamera_context:
+            picamera_context.stop()
             
     
     for _ in range(len(procs)):
-        video_queue.put( [(None, None, None, None)] )
+        video_queue.put( [(None, None, None)] )
         
     #wait for all ongoing threads
     for proc in procs:
@@ -565,7 +637,7 @@ if __name__ == "__main__":
             while True:
                 try:
                     st = datetime.timestamp(datetime.now())
-                    blur_quality_list.append(results_queue.get(block = False)[blur_function])
+                    results_queue.get(block = False)
                     images_processed += 1
                     if PRINT_TIME_PROFILING:
                         print("queue get", datetime.timestamp(datetime.now()) - st)
@@ -585,6 +657,8 @@ if __name__ == "__main__":
 
     # resultslist will be empty here... 
     end_time = datetime.timestamp(datetime.now())
+
+    socketio.shutdown()
 
     print("{:.1f} images per second blur processed ({} / {} s)".format(images_processed / (end_time - start_time), 
                                                                 images_processed, (end_time - start_time)))

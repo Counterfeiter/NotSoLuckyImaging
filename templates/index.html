@@ -15,33 +15,58 @@
             <div class="col-lg-8  offset-lg-2">
                 <h2 class="mt-5">Not so Lucky Imaging APP</h2>
                 <form method="post" action="{{ url_for('gui_task') }}">
-                    <input type="submit" value="Start/Stop Recording" name="recording" />
+                    <input type="button" value="Start Recording" name="recording" id="recording" />
                     <div>
                         <input type="range" id="gain" name="gain" , min="1" max="31">
-                        <label for="gain">Gain</label>
-                        <input type="range" id="exposure" name="exposure" , min="500" max="7300000">
-                        <label for="exposure">Exposure Time</label> <output id="exposure_output">100 µs</output>
-                        <input type="submit" value="Change Settings" name="setup" />
-
-                        <script>
-                            var socket = io()
-                            socket.on('connect', function () {
-                                socket.emit('my event', { data: 'I\'m connected!' });
-                            });
-
-                            const exposure_output = document.querySelector("#exposure_output")
-                            const input = document.querySelector("#exposure")
-                            exposure_output.textContent = input.value
-                            input.addEventListener("input", (event) => {
-                                exposure_output.textContent = event.target.value + " µs"
-                                socket.emit('slider_exposure', { value: event.target.value });
-                                socket.emit('message', { value: event.target.value });
-                            })
-                        </script>
+                        <label for="gain">Gain: </label><output id="gain_output">dB</output>
                     </div>
+                    <div>
+                        <input type="range" id="exposure" name="exposure" , min="500" max="7300000">
+                        <label for="exposure">Exposure Time: </label> <output id="exposure_output">µs</output>
+                    </div>
+                    <div>
+                        <p>Select the evaluation function for the live image</p>
+                        <input type="radio" id="Laplace" name="fav_function" value="Laplace">
+                        <label for="Laplace">Laplace</label>
+                        <input type="radio" id="BlurFunction" name="fav_function" value="BlurFunction">
+                        <label for="BlurFunction">Blur Function</label>
+                        <input type="radio" id="StarQuality" name="fav_function" value="StarQuality">
+                        <label for="StarQuality">Star Quality (Deep Sky)</label>
+                    </div>
+                    <script>
+                        var socket = io()
+                        socket.on('connect', function () {
+                            socket.emit('connectevent', { data: 'I\'m connected!' });
+                        });
 
+                        const exposure_output = document.querySelector("#exposure_output")
+                        const gain_output = document.querySelector("#gain_output")
+                        const exposure_input = document.querySelector("#exposure")
+                        const gain_input = document.querySelector("#gain")
+                        const startstop_input = document.querySelector("#recording")
+                        const function_inputs = document.querySelectorAll('input[type=radio][name="fav_function"]');
+                        exposure_output.textContent = exposure_input.value + " µs"
+                        gain_output.textContent = String(parseFloat(gain_input.value) * 10) + " dB"
+                        startstop_input.addEventListener("click", (event) => {
+                            socket.emit('startstop_button', { value: startstop_input.value });
+                            if (startstop_input.value === "Stop recording")
+                                startstop_input.value = "Start recording"
+                            else
+                                startstop_input.value = "Stop recording"
+                        })
+                        exposure_input.addEventListener("change", (event) => {
+                            exposure_output.textContent = event.target.value + " µs"
+                            socket.emit('exposure_input', { value: event.target.value });
+                        })
+                        gain_input.addEventListener("change", (event) => {
+                            gain_output.textContent = String(parseFloat(event.target.value) * 10) + " dB"
+                            socket.emit('gain_input', { value: event.target.value });
+                        })
+                        function_inputs.forEach(radio => radio.addEventListener('change', () =>
+                            socket.emit('function_selection', { value: radio.value })))
+                    </script>
                 </form>
-                <img src="{{ url_for('live_feed') }}" height="50%">
+                <img src="{{ url_for('live_feed') }}" height="70%">
             </div>
         </div>
     </div>
