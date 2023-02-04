@@ -32,16 +32,19 @@ from skimage.color import rgb2gray
 import skimage
 from astropy.io import fits
 
+from pyindi_guider import LX200MountGuide
+
 PRINT_TIME_PROFILING = False
 
-WEBSERVER_PORT = 8084
+WEBSERVER_PORT = 8080
 
 session = {
-    "object_name": "Jupiter",
+    "object_name": "Star",
     "save_image_dng" : False,
     "save_image_fits" : True,
     #"img_folder": "/home/pi/luckyimaging/",
-    "img_folder" : "/media/pi/LOG_DONGLE/",
+    #"img_folder" : "/media/pi/LOG_DONGLE/",
+    "img_folder" : "/media/pi/astro",
     "tmp_folder" : "/tmp/",
     "num_cpus": 4,
     "images_per_process": 1
@@ -57,7 +60,7 @@ raw_camera_settings = {
 }
 
 manual_quality_settings = {
-    "store_procent_of_passed_images": 1,
+    "store_procent_of_passed_images": 3,
     "analyse_frames_per_settings": 20,
     "min_dynamic_range": 1, # %
     # allow three pixels (dead pixels?) to be saturated
@@ -100,12 +103,18 @@ config = {
     #"ScalerCrop": offset + size # roi could be used later
 }
 
-max_adc_range = 2**raw_camera_settings["bit_depth"] - 1
+#hack to disable satturation discards
+max_adc_range = 5000 #2**raw_camera_settings["bit_depth"] - 1
 pixel_cnt = raw_camera_settings["size"][0] * raw_camera_settings["size"][1]
 
 picamera_setsaveexit = None
 
 enable_recording = False
+
+# use to guide the telescope over indi in the main loop
+guide_pulse = { "dir" : "N",
+                "time" : 0
+                }
 
 processed_images = deque(maxlen=5)
 
@@ -427,9 +436,20 @@ def handle_sio_startstop_button(data):
     global enable_recording
     try:
         enable_recording = True if "Start" in data["value"] else False
+        print("Recording ", enable_recording)
     except:
         pass
     #print('received message: ' + str(data))
+
+@socketio.on('guidepulse')
+def handle_sio_guide_command(data):
+    global guide_pulse
+    try:
+        guide_pulse["dir"] = data["dir"]
+        guide_pulse["time"] = float(data["time"])
+        print("Guide ", data)
+    except:
+        pass
 
 @socketio.on('gain_input')
 def handle_sio_gain_input(data):
@@ -486,6 +506,8 @@ if __name__ == "__main__":
     images_processed = 0
 
     threading.Thread(target=lambda: socketio.run(app, host='0.0.0.0', port=WEBSERVER_PORT, use_reloader=False)).start()
+
+    guider = LX200MountGuide("localhost", 7624)
 
     if len(sys.argv) > 1:
         test_file = sys.argv[1]
@@ -558,6 +580,10 @@ if __name__ == "__main__":
 
         while picamera_setsaveexit == False:
             socketio.sleep(0.01) # yield
+
+            if guide_pulse["time"] > 0:
+                guider.guide(guide_pulse["dir"], guide_pulse["time"])
+                guide_pulse["time"] = 0 #call only one per button click
 
             if blur_function != manual_quality_settings["use_eval_function"]:
                 if manual_quality_settings["use_eval_function"] == "starquality":

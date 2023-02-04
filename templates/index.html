@@ -21,7 +21,7 @@
                         <label for="gain">Gain: </label><output id="gain_output">dB</output>
                     </div>
                     <div>
-                        <input type="range" id="exposure" name="exposure" , min="500" max="7300000">
+                        <input type="range" id="exposure" name="exposure" , min="0" max="1000">
                         <label for="exposure">Exposure Time: </label> <output id="exposure_output">µs</output>
                     </div>
                     <div>
@@ -33,17 +33,51 @@
                         <input type="radio" id="StarQuality" name="fav_function" value="StarQuality">
                         <label for="StarQuality">Star Quality (Deep Sky)</label>
                     </div>
+                    <div>
+                        <input type="button" value="Guide North" name="guidenorth" id="guidenorth" />
+                        <input type="button" value="Guide South" name="guidesouth" id="guidesouth" />
+                        <input type="button" value="Guide West" name="guidewest" id="guidewest" />
+                        <input type="button" value="Guide East" name="guideeast" id="guideeast" />
+                    </div>
+                    <div>
+                        <input type="range" id="guidetime" name="guidetime" , min="100" max="3000">
+                        <label for="guidetime">Guide time: </label><output id="guidetime_output">ms</output>
+                    </div>
                     <script>
                         var socket = io()
                         socket.on('connect', function () {
                             socket.emit('connectevent', { data: 'I\'m connected!' });
                         });
 
+                        function logslider(position) {
+                            // position will be between 0 and 100
+                            var minp = 0;
+                            var maxp = 1000;
+
+                            // The result should be between 100 an 10000000
+                            var minv = Math.log(500);
+                            var maxv = Math.log(7000000);
+
+                            // calculate adjustment factor
+                            var scale = (maxv - minv) / (maxp - minp);
+
+                            return Math.round(Math.exp(minv + scale * (position - minp)));
+                        }
+
                         const exposure_output = document.querySelector("#exposure_output")
                         const gain_output = document.querySelector("#gain_output")
                         const exposure_input = document.querySelector("#exposure")
                         const gain_input = document.querySelector("#gain")
                         const startstop_input = document.querySelector("#recording")
+
+                        const guidenorth_input = document.querySelector("#guidenorth")
+                        const guidesouth_input = document.querySelector("#guidesouth")
+                        const guidewest_input = document.querySelector("#guidewest")
+                        const guideeast_input = document.querySelector("#guideeast")
+
+                        const guidetime_input = document.querySelector("#guidetime")
+                        const guidetime_output = document.querySelector("#guidetime_output")
+
                         const function_inputs = document.querySelectorAll('input[type=radio][name="fav_function"]');
                         exposure_output.textContent = exposure_input.value + " µs"
                         gain_output.textContent = String(parseFloat(gain_input.value) * 10) + " dB"
@@ -54,13 +88,34 @@
                             else
                                 startstop_input.value = "Stop recording"
                         })
+
+                        guidenorth_input.addEventListener("click", (event) => {
+                            socket.emit('guidepulse', { time: guidetime_input.value, dir: "N" });
+                        })
+                        guidesouth_input.addEventListener("click", (event) => {
+                            socket.emit('guidepulse', { time: guidetime_input.value, dir: "S" });
+                        })
+                        guidewest_input.addEventListener("click", (event) => {
+                            socket.emit('guidepulse', { time: guidetime_input.value, dir: "W" });
+                        })
+                        guideeast_input.addEventListener("click", (event) => {
+                            socket.emit('guidepulse', { time: guidetime_input.value, dir: "E" });
+                        })
+
                         exposure_input.addEventListener("change", (event) => {
-                            exposure_output.textContent = event.target.value + " µs"
-                            socket.emit('exposure_input', { value: event.target.value });
+                            socket.emit('exposure_input', { value: logslider(event.target.value) });
                         })
                         gain_input.addEventListener("change", (event) => {
-                            gain_output.textContent = String(parseFloat(event.target.value) * 10) + " dB"
                             socket.emit('gain_input', { value: event.target.value });
+                        })
+                        guidetime_input.addEventListener("input", (event) => {
+                            guidetime_output.textContent = event.target.value + " ms"
+                        })
+                        exposure_input.addEventListener("input", (event) => {
+                            exposure_output.textContent = logslider(event.target.value) + " µs"
+                        })
+                        gain_input.addEventListener("input", (event) => {
+                            gain_output.textContent = String(parseFloat(event.target.value) * 10) + " dB"
                         })
                         function_inputs.forEach(radio => radio.addEventListener('change', () =>
                             socket.emit('function_selection', { value: radio.value })))
