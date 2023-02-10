@@ -55,7 +55,7 @@ raw_camera_settings = {
     "size_processing": (800, 600),
     "bayerformat": "SRGGB12",
     "bit_depth": 12,
-    "max_fps": 1,
+    "max_fps": 5,
     "analoggain": (1, 31)  # (min, max)
 }
 
@@ -186,18 +186,22 @@ def process_frames(process_id, video_queue, results):
             try:
                 arr = np.frombuffer(buf, dtype=np.uint16).reshape(
                     (raw_camera_settings["size"][1], raw_camera_settings["size"][0]))
-                arr_rgb = np.frombuffer(gray, dtype=np.uint8).reshape(
-                    (raw_camera_settings["size_processing"][1], raw_camera_settings["size_processing"][0], 3))
             except Exception as e:
                 print(e)
                 continue
 
-            st = datetime.timestamp(datetime.now())
-            # convert bayer to grayscale with convolution - there is no fancy debayer algo. ongoing
-            # stride_conv_strided(arr)
-            gray_image = rgb2gray(arr_rgb.astype(np.float32))
-            if PRINT_TIME_PROFILING:
-                print("rgb2gray", datetime.timestamp(datetime.now()) - st)
+            try:
+                arr_rgb = np.frombuffer(gray, dtype=np.uint8).reshape(
+                    (raw_camera_settings["size_processing"][1], raw_camera_settings["size_processing"][0], 3))
+                gray_image = rgb2gray(arr_rgb.astype(np.float32))
+            except Exception as e:
+                try:
+                    # try if it is still a gray scale image or one layer
+                    gray_image = np.frombuffer(gray, dtype=np.uint8).reshape(
+                        (raw_camera_settings["size_processing"][1], raw_camera_settings["size_processing"][0]))
+                except Exception as e:
+                    print(e)
+                    continue
 
             st = datetime.timestamp(datetime.now())
             min_value, max_value = np.percentile(
@@ -587,9 +591,12 @@ if __name__ == "__main__":
         camera = PiCamera2(
             raw_camera_settings["size"], raw_camera_settings["size_processing"])
     except:
-        from cameras.basecamera import BaseCamera
-        camera = BaseCamera(
-            raw_camera_settings["size"], list(raw_camera_settings["size_processing"]) + [3])
+        from cameras.folderloopcamera import FolderLoopCamera
+        camera = FolderLoopCamera(
+            raw_camera_settings["size"], list(raw_camera_settings["size_processing"]), scanfolder="/home/basti/Documents/Astro/OrionTrapez/lights")
+        # from cameras.basecamera import BaseCamera
+        # camera = BaseCamera(
+        #     raw_camera_settings["size"], list(raw_camera_settings["size_processing"]) + [3])
 
     procs = []
     for i in range(session["num_cpus"]):
